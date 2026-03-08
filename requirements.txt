@@ -1,0 +1,15 @@
+# Vektordatenbank + Embeddings
+chromadb==1.1.1
+sentence-transformers==5.1.1
+
+# PDF-Verarbeitung
+PyMuPDF==1.26.4
+
+# LLM-Clients
+anthropic==0.84.0
+requests==2.32.3
+
+# API-Server
+fastapi==0.128.0
+pydantic==2.11.10
+uvicorn==0.37.0
