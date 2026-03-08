@@ -147,20 +147,36 @@ def _summarize_invoice_for_llm(inv_id: str, data: Dict[str, Any]) -> Dict[str, A
         "validiert": final.get("validiert"),
     }
 
+# Generische deutsche Stoppwörter und das Wort "Rechnung" selbst (erscheint in jedem
+# Rechnungskontext) werden aus den Query-Tokens herausgefiltert, damit sie keinen
+# fälschlichen Score-Bonus auf zufällig passende Rechnungen geben.
+_STOP_WORDS = {
+    "die", "der", "das", "ein", "eine", "einer", "eines", "einem", "den", "dem",
+    "und", "oder", "aber", "hat", "ist", "sind", "von", "auf", "mit", "fur",
+    "bei", "aus", "zur", "zum", "nach", "seit", "vor", "uber", "unter", "wie",
+    "wer", "was", "wen", "wem", "welche", "welcher", "welches", "welchem", "welchen",
+    "zeig", "zeige", "gibt", "bitte", "kann", "alle", "alles", "mir", "mich",
+    "ich", "wir", "sie", "uns", "ihr", "bin", "war", "sich", "auch", "nicht",
+    "mehr", "nur", "noch", "mal", "schon", "immer", "sehr", "ganz", "dann",
+    "rechnung", "rechnungen",  # generisches Wort für Invoice – nicht spezifisch genug
+}
+
+
 def _select_invoices_by_message(files: List[str], message: str, limit: int = 6,
                                 history: Optional[List[Dict[str, str]]] = None) -> List[str]:
-    # Simples Token-Matching statt semantischer Suche – reicht für wenige Rechnungen,
-    # und es gibt keine race condition mit ChromaDB wenn der Store leer ist.
     all_text = message or ""
     if history:
         for h in history[-4:]:
             all_text += " " + h.get("content", "")
 
-    combined = all_text
-    msg_l = combined.lower()
-    tokens = [t for t in re.split(r"\W+", msg_l) if len(t) >= 3]
+    msg_l = all_text.lower()
+    raw_tokens = [t for t in re.split(r"\W+", msg_l) if len(t) >= 3]
 
+    # Rechnungsnummer-Patterns immer behalten (z.B. RE250004, BCE-0001)
     invoice_no_tokens = re.findall(r'\b(RE\d+|BCE\w+|\w+-\d+)\b', all_text, re.I)
+
+    # Stoppwörter rausfiltern – nur bedeutungstragende Tokens behalten
+    tokens = [t for t in raw_tokens if t not in _STOP_WORDS]
     tokens += [t.lower() for t in invoice_no_tokens]
 
     if not tokens:
@@ -171,38 +187,49 @@ def _select_invoices_by_message(files: List[str], message: str, limit: int = 6,
         inv_id = _invoice_id_from_filename(fn)
         data = _load_invoice_json_by_id(inv_id)
         final = data.get("final") or {}
-        filename_clean = re.sub(r'[_\-\d]', ' ', data.get('filename', '')).lower()
+
+        # Dateiname-Tokens: spezifischstes Signal → 5× Gewicht
+        fn_tokens = {
+            t.lower()
+            for t in re.split(r"[\W_\d]+", data.get("filename", ""))
+            if len(t) >= 3 and t.lower() not in _STOP_WORDS
+        }
+
         pos_text = " ".join(
             _safe_str(p.get("beschreibung"))
             for p in (final.get("positionen") or [])
         )
-        hay = _dedup_spaces(" ".join([
-            _safe_str(data.get("filename")),
+        content_hay = _dedup_spaces(" ".join([
             _safe_str(final.get("rechnungsnummer")),
             _safe_str(final.get("rechnungsdatum")),
             _safe_str(final.get("absender")),
             _safe_str(final.get("empfaenger")),
             _safe_str(final.get("waehrung")),
             pos_text,
-        ]) + " " + filename_clean).lower()
+        ])).lower()
 
-        score = sum(1 for t in tokens if t in hay)
+        score = 0
+        for t in tokens:
+            if t in fn_tokens:
+                score += 5  # Dateiname-Match: sehr spezifisch
+            elif t in content_hay:
+                score += 1  # Inhalts-Match: weniger spezifisch
+
         if score > 0:
             scores[inv_id] = score
 
     if not scores:
         return [_invoice_id_from_filename(files[0])] if files else []
 
-    # Eindeutiger Treffer: nur eine Rechnung hat score >= 1
-    if len(scores) == 1:
-        return [list(scores.keys())[0]]
+    best_score = max(scores.values())
+    best = max(scores, key=lambda k: scores[k])
 
-    # Klarer Gewinner: score >= 2
-    if max(scores.values()) >= 2:
-        best = max(scores, key=lambda k: scores[k])
+    # Eindeutiger oder klarer Gewinner (höchster Score allein oben)
+    tied_best = [k for k, v in scores.items() if v == best_score]
+    if len(tied_best) == 1:
         return [best]
 
-    # Mehrere gleich schwache Treffer: top 3 zurückgeben
+    # Mehrere gleich starke Treffer: top 3 zurückgeben
     top = sorted(scores, key=lambda k: scores[k], reverse=True)[:3]
     return top
 
