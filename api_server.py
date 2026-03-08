@@ -62,6 +62,48 @@ def _dedup_spaces(s: str) -> str:
 def _safe_str(x: Any) -> str:
     return str(x or "").strip()
 
+# Reihenfolge wichtig: längere/spezifischere Strings zuerst
+_COUNTRY_KEYWORDS = [
+    ("niederlande", "Niederlande"), ("netherlands", "Niederlande"), ("holland", "Niederlande"),
+    ("vereinigte staaten", "USA"), ("united states", "USA"),
+    ("österreich", "Österreich"), ("austria", "Österreich"),
+    ("schweiz", "Schweiz"), ("switzerland", "Schweiz"),
+    ("frankreich", "Frankreich"), ("france", "Frankreich"),
+    ("großbritannien", "Großbritannien"), ("united kingdom", "Großbritannien"),
+    ("deutschland", "Deutschland"), ("germany", "Deutschland"),
+    ("usa", "USA"),
+]
+
+def _detect_country(address: str) -> str:
+    """Land aus Adresstext ableiten: explizite Ländernamen oder 5-stellige PLZ → Deutschland."""
+    addr_lower = (address or "").lower()
+    for keyword, country in _COUNTRY_KEYWORDS:
+        if keyword in addr_lower:
+            return country
+    if re.search(r'\b\d{5}\b', address or ""):
+        return "Deutschland"
+    return "unbekannt"
+
+
+# Erkennt Queries die sich auf alle oder mehrere Rechnungen beziehen
+_ALL_INVOICES_RE = re.compile(
+    r'\b('
+    r'welche\s+rechnungen|'
+    r'alle[nr]?\s+(rechnungen?|unternehmen?|firmen?|absender)|'
+    r'gesamt(summe|betrag|übersicht|aller)|'
+    r'summier[et]\s+alle|'
+    r'rechnungen?\s+(vergleich|insgesamt|übersicht)|'
+    r'aller\s+rechnungen?|'
+    r'deutschen\s+unternehmen|'
+    r'welche\s+firmen|'
+    r'überblick\s+über\s+alle'
+    r')\b',
+    re.IGNORECASE,
+)
+
+def _is_all_invoices_query(message: str) -> bool:
+    return bool(_ALL_INVOICES_RE.search(message or ""))
+
 # -------------------------
 # Models
 # -------------------------
@@ -131,6 +173,7 @@ def _compute_answer_from_invoice(final: Dict[str, Any], wants: Dict[str, Any]) -
 def _summarize_invoice_for_llm(inv_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     final = data.get("final") or {}
     positionen = (final.get("positionen") or [])[:30]
+    absender = final.get("absender") or ""
     return {
         "id": inv_id,
         "filename": data.get("filename"),
@@ -141,7 +184,8 @@ def _summarize_invoice_for_llm(inv_id: str, data: Dict[str, Any]) -> Dict[str, A
         "steuer": final.get("steuer"),
         "versand": final.get("versand"),
         "brutto": final.get("brutto"),
-        "absender": final.get("absender"),
+        "absender": absender,
+        "absender_land": _detect_country(absender),
         "empfaenger": final.get("empfaenger"),
         "positionen_anzahl": len(positionen),
         "positionen": positionen,
@@ -241,12 +285,16 @@ def _list_all_invoices_summary() -> str:
         try:
             data = _load_invoice_json_by_id(inv_id)
             f = data.get("final") or {}
+            absender = _safe_str(f.get("absender"))
+            land = _detect_country(absender)
             lines.append(
                 f"- {inv_id}: "
-                f"Absender={_safe_str(f.get('absender')).split(chr(10))[0]}, "
+                f"Absender={absender.split(chr(10))[0]}, "
+                f"Land={land}, "
                 f"Empfaenger={_safe_str(f.get('empfaenger')).split(chr(10))[0]}, "
                 f"Nr={f.get('rechnungsnummer', '?')}, "
                 f"Datum={f.get('rechnungsdatum', '?')}, "
+                f"Waehrung={f.get('waehrung', '?')}, "
                 f"Netto={f.get('netto', '?')}, "
                 f"Steuer={f.get('steuer', '?')}, "
                 f"Brutto={f.get('brutto', '?')}"
@@ -386,7 +434,11 @@ def chat(req: ChatRequest):
     # 1) invoiceIds aus Frontend oder per Suche bestimmen
     invoice_ids = (req.invoiceIds or [])
     if not invoice_ids:
-        invoice_ids = _select_invoices_by_message(files, req.message, limit=6, history=req.history)
+        if _is_all_invoices_query(req.message):
+            # Aggregationsabfragen: alle Rechnungen laden damit das LLM vollständig rechnen kann
+            invoice_ids = [_invoice_id_from_filename(f) for f in files]
+        else:
+            invoice_ids = _select_invoices_by_message(files, req.message, limit=6, history=req.history)
 
     # 2) invoices laden + zusammenfassen
     invoice_summaries = []
