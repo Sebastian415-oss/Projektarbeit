@@ -130,7 +130,7 @@ def _compute_answer_from_invoice(final: Dict[str, Any], wants: Dict[str, Any]) -
 # -------------------------
 def _summarize_invoice_for_llm(inv_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     final = data.get("final") or {}
-    
+    positionen = (final.get("positionen") or [])[:30]
     return {
         "id": inv_id,
         "filename": data.get("filename"),
@@ -143,7 +143,8 @@ def _summarize_invoice_for_llm(inv_id: str, data: Dict[str, Any]) -> Dict[str, A
         "brutto": final.get("brutto"),
         "absender": final.get("absender"),
         "empfaenger": final.get("empfaenger"),
-        "positionen": (final.get("positionen") or [])[:20],
+        "positionen_anzahl": len(positionen),
+        "positionen": positionen,
         "validiert": final.get("validiert"),
     }
 
@@ -255,18 +256,30 @@ def _list_all_invoices_summary() -> str:
     return "\n".join(lines)
 
 
+def _is_readable_chunk(text: str, min_ratio: float = 0.5) -> bool:
+    """Garbled PDF-Chunks (zeichenweise Zeilenumbrüche) herausfiltern.
+    Misst den Anteil normaler Wörter (>=3 Zeichen) an der Gesamtzeichenzahl."""
+    words = re.findall(r'\b\w{3,}\b', text)
+    if not words:
+        return False
+    word_chars = sum(len(w) for w in words)
+    return (word_chars / max(len(text), 1)) >= min_ratio
+
+
 def _retrieve_chat_context(query: str, invoice_ids: List[str]) -> List[str]:
     try:
         if _chroma_collection is None:
             return []
         results = _chroma_collection.query(
             query_texts=[query],
-            n_results=3,
+            n_results=5,
             where={"source": {"$in": invoice_ids}},
         )
         docs = results.get("documents") or []
-        chunks = [c[:400] for c in docs[0]] if docs else []
-        return chunks
+        raw_chunks = docs[0] if docs else []
+        # Garbled Chunks (zeichenweise aus PDF) herausfiltern
+        chunks = [c[:500] for c in raw_chunks if _is_readable_chunk(c)]
+        return chunks[:3]
     except Exception:
         return []
 
@@ -277,12 +290,19 @@ def _llm_answer(message: str, invoice_summaries: List[Dict[str, Any]], model: st
     all_invoices = _list_all_invoices_summary()
 
     system = (
-        "Du bist ein Rechnungs-Assistent. Antworte kurz, klar und korrekt.\n"
+        "Du bist ein Rechnungs-Assistent. Antworte vollständig, klar und korrekt.\n"
         "WICHTIG:\n"
-        "- Nutze ausschließlich die Daten aus `invoices` und `all_invoices_overview`.\n"
-        "- Wenn etwas nicht vorhanden ist: sag das offen.\n"
+        "- Alle Daten die du brauchst stehen in `invoices[]` (strukturierte JSON-Daten) "
+        "und in `all_invoices_overview` (Kurzübersicht aller Rechnungen).\n"
+        "- Die Positionen einer Rechnung findest du unter invoices[].positionen – "
+        "liste sie IMMER vollständig auf wenn danach gefragt wird.\n"
+        "- Sage NIEMALS, dass Daten fehlen oder nicht vorhanden sind, wenn sie in "
+        "invoices[].positionen, invoices[].absender, invoices[].empfaenger oder "
+        "einem anderen Feld von invoices[] stehen.\n"
+        "- Erfinde keine Werte. Wenn ein Feld wirklich null/leer ist: sag es kurz.\n"
         "- Wenn die Frage mehrere Rechnungen betrifft: gib eine strukturierte Übersicht.\n"
-        "- Wenn der Nutzer eine bestimmte Rechnung meint: identifiziere sie über Rechnungsnummer/Datum/Absender/Empfänger.\n"
+        "- Wenn der Nutzer eine bestimmte Rechnung meint: identifiziere sie über "
+        "Rechnungsnummer, Datum, Absender oder Empfänger.\n"
         "- Antworte auf Deutsch.\n"
         f"\nAlle verfügbaren Rechnungen (Übersicht):\n{all_invoices}\n"
     )
@@ -313,8 +333,8 @@ def _llm_answer(message: str, invoice_summaries: List[Dict[str, Any]], model: st
         model=model,
         messages=messages,
         temperature=0.0,
-        timeout_s=90,
-        num_predict=400,
+        timeout_s=120,
+        num_predict=800,
         retries=1,
     )
     return ((resp.get("message") or {}).get("content") or "").strip()
